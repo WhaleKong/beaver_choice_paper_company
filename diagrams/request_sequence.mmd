@@ -1,0 +1,47 @@
+%%{init: {"sequence": {"messageFontSize": 15, "noteFontSize": 14, "actorFontSize": 15, "messageMargin": 38, "noteMargin": 12, "boxTextMargin": 8, "mirrorActors": false}, "themeVariables": {"fontSize": "15px"}}}%%
+%% Lifecycle of one customer request through the Munder Difflin multi-agent system.
+%% Arrows are tool calls or delegations; notes are reasoning steps inside one agent.
+sequenceDiagram
+    autonumber
+    actor C as Customer
+    participant O as Orchestrator Agent
+    participant I as Inventory Agent
+    participant Q as Quoting Agent
+    participant S as Sales Agent
+    participant DB as SQLite DB
+    participant SUP as Supplier (simulated)
+
+    C->>O: Quote request text + date of request
+    Note over O: Parse items, quantities, needed-by date
+    O->>I: Check items (raw names, qty, request date, needed-by date)
+    I->>DB: check_inventory -> get_all_inventory(request date)
+    Note over I: find_catalog_items: map to exact names, drop unknown items
+    I->>DB: check_stock_level -> get_stock_level(item, request date)
+
+    opt Stock short of requested qty, or would fall below min_stock_level
+        I->>SUP: check_supplier_delivery -> get_supplier_delivery_date(date, qty)
+        I->>DB: check_cash_balance -> get_cash_balance(date)
+        alt Supplier ETA <= needed-by date AND cash covers the cost
+            I->>DB: restock_item -> create_transaction('stock_orders')
+        else Too late or not enough cash
+            Note over I: Mark item unavailable (with reason)
+        end
+    end
+
+    I-->>O: Availability report (exact names, fulfillable qty, ETA, unavailable + reason)
+
+    alt Nothing can be fulfilled
+        O-->>C: Polite decline with reason (skip quoting and sale)
+    else At least one item can be fulfilled
+        O->>Q: Fulfillable items, qty, customer context (job, event, order size)
+        Q->>DB: search_past_quotes -> search_quote_history(terms)
+        Note over Q: get_unit_price x qty, then calculate_quote<br/>applies the bulk discount tier
+        Q-->>O: Quote (line items, discount, total, rationale)
+        O->>S: Finalize order with accepted quote
+        S->>DB: check_stock_level -> get_stock_level (re-verify)
+        S->>DB: fulfill_order -> create_transaction('sales') per line item
+        S->>SUP: check_delivery_date -> get_supplier_delivery_date (delivery ETA)
+        S->>DB: get_financial_report -> generate_financial_report(date)
+        S-->>O: Order confirmation (transaction ids, delivery date)
+        O-->>C: Quote + discount + delivery date (+ items not fulfilled and why)
+    end

@@ -1,0 +1,61 @@
+%%{init: {"flowchart": {"nodeSpacing": 45, "rankSpacing": 60, "curve": "basis", "wrappingWidth": 460}, "themeVariables": {"fontSize": "16px"}}}%%
+%% Munder Difflin multi-agent architecture (smolagents, 4 agents).
+%% Numbers on the arrows give the order of delegation; each arrow carries "request / result".
+%% Tool boxes list each tool and the starter helper it wraps. Thick arrows are database writes.
+flowchart TB
+    CUST(["<b>Customer</b><br/>quote request text + date of request"])
+
+    subgraph MAS["Munder Difflin Multi-Agent System (smolagents, 4 agents)"]
+        direction TB
+        ORCH["<b>Orchestrator Agent</b><br/>ToolCallingAgent with managed_agents<br/>parse items, quantities, needed-by date<br/>delegate in order: Inventory, Quoting, Sales<br/>skip Quoting + Sales if nothing can be fulfilled<br/>write the customer reply (no internal data)"]
+        INV["<b>Inventory Agent</b><br/>map requests to exact catalog names<br/>check stock as of the request date<br/>restock when short or below min level,<br/>only if supplier ETA fits and cash allows"]
+        QUO["<b>Quoting Agent</b><br/>price the fulfillable items<br/>compare with similar past quotes<br/>apply the bulk discount tier<br/>explain the price to the customer"]
+        SAL["<b>Sales Agent</b><br/>re-verify stock before selling<br/>record one sale per line item<br/>estimate the delivery date<br/>refresh the financial report"]
+
+        ORCH <-- "<b>1</b> items, qty, dates<br/>/ availability report" --> INV
+        ORCH <-- "<b>2</b> fulfillable items, context<br/>/ quote + discount" --> QUO
+        ORCH <-- "<b>3</b> accepted quote<br/>/ order confirmation" --> SAL
+    end
+
+    CUST <-- "request + date<br/>/ quote, delivery date,<br/>items not fulfilled + why" --> ORCH
+
+    INVT["<b>Inventory tools</b><br/>find_catalog_items &rarr; paper_supplies<br/>check_inventory &rarr; get_all_inventory()<br/>check_stock_level &rarr; get_stock_level()<br/>check_supplier_delivery &rarr; get_supplier_delivery_date()<br/>check_cash_balance &rarr; get_cash_balance()<br/>restock_item &rarr; create_transaction('stock_orders')"]
+    QUOT["<b>Quoting tools</b><br/>search_past_quotes &rarr; search_quote_history()<br/>get_unit_price &rarr; paper_supplies<br/>calculate_quote &rarr; bulk discount tiers"]
+    SALT["<b>Sales tools</b><br/>check_stock_level &rarr; get_stock_level()<br/>check_delivery_date &rarr; get_supplier_delivery_date()<br/>fulfill_order &rarr; create_transaction('sales')<br/>get_financial_report &rarr; generate_financial_report()"]
+
+    INV --- INVT
+    QUO --- QUOT
+    SAL --- SALT
+
+    subgraph DATA["Data sources"]
+        direction LR
+        %% Declared in this order so the layout keeps Inventory, Quoting, Sales left to right.
+        SUP[/"<b>Supplier</b> (simulated)<br/>lead time grows with quantity"/]
+        DB[("<b>SQLite: munder_difflin.db</b><br/>transactions, inventory,<br/>quotes, quote_requests")]
+        CAT[["<b>Product catalog</b><br/>paper_supplies<br/>exact names + unit prices"]]
+    end
+
+    INVT -- "names" --> CAT
+    INVT -- "read stock, cash" --> DB
+    INVT == "write stock_orders" ==> DB
+    INVT -- "restock ETA" --> SUP
+    QUOT -- "unit prices" --> CAT
+    QUOT -- "read past quotes" --> DB
+    SALT == "write sales" ==> DB
+    SALT -- "read stock, report" --> DB
+    SALT -- "delivery ETA" --> SUP
+
+    classDef customer fill:#FFF4E5,stroke:#C76B00,stroke-width:2px,color:#3D2200
+    classDef orchestrator fill:#E8EEFF,stroke:#2F4FD0,stroke-width:2px,color:#0F1B4D
+    classDef worker fill:#EAF7EE,stroke:#22874A,stroke-width:2px,color:#0B3319
+    classDef tool fill:#FFFFFF,stroke:#8A8F98,stroke-width:1px,color:#1F2328
+    classDef data fill:#F3EEFF,stroke:#6B46C1,stroke-width:2px,color:#24124F
+
+    class CUST customer
+    class ORCH orchestrator
+    class INV,QUO,SAL worker
+    class INVT,QUOT,SALT tool
+    class CAT,DB,SUP data
+
+    linkStyle 4,5,6 stroke:#8A8F98,stroke-dasharray:4 3
+    linkStyle 9,13 stroke:#C23B3B,stroke-width:3px
