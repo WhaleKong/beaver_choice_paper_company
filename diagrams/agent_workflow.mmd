@@ -1,31 +1,38 @@
 %%{init: {"flowchart": {"nodeSpacing": 45, "rankSpacing": 60, "curve": "basis", "wrappingWidth": 460}, "themeVariables": {"fontSize": "16px"}}}%%
 %% Munder Difflin multi-agent architecture (smolagents, 4 agents).
 %% Numbers on the arrows give the order of delegation; each arrow carries "request / result".
-%% Tool boxes list each tool and the starter helper it wraps. Thick arrows are database writes.
+%% Tool boxes list each tool and the starter helpers it uses. Thick arrows are database writes.
+%% Dotted orange arrows show REQUEST_CONTEXT, the per-request state the tools share.
 flowchart TB
     CUST(["<b>Customer</b><br/>quote request text + date of request"])
 
     subgraph MAS["Munder Difflin Multi-Agent System (smolagents, 4 agents)"]
         direction TB
-        ORCH["<b>Orchestrator Agent</b><br/>ToolCallingAgent with managed_agents<br/>parse items, quantities, needed-by date<br/>delegate in order: Inventory, Quoting, Sales<br/>skip Quoting + Sales if nothing can be fulfilled<br/>write the customer reply (no internal data)"]
-        INV["<b>Inventory Agent</b><br/>map requests to exact catalog names<br/>check stock as of the request date<br/>restock when short or below min level,<br/>only if supplier ETA fits and cash allows"]
-        QUO["<b>Quoting Agent</b><br/>price the fulfillable items<br/>compare with similar past quotes<br/>apply the bulk discount tier<br/>explain the price to the customer"]
-        SAL["<b>Sales Agent</b><br/>re-verify stock before selling<br/>record one sale per line item<br/>estimate the delivery date<br/>refresh the financial report"]
+        ORCH["<b>Orchestrator Agent</b> (gpt-4o)<br/>ToolCallingAgent with managed_agents<br/>one agent per step (no parallel tool calls)<br/>delegate in order: Inventory, Quoting, Sales<br/>skip Quoting + Sales only if no item is available<br/>final answer check: available items must be sold first<br/>write the customer reply (no internal data)"]
+        INV["<b>Inventory Agent</b> (gpt-4o-mini)<br/>send every requested item to check_inventory once<br/>report each row as available, not carried,<br/>or insufficient stock, with its note"]
+        QUO["<b>Quoting Agent</b> (gpt-4o-mini)<br/>price the available items with calculate_quote<br/>explain the price using similar past quotes"]
+        SAL["<b>Sales Agent</b> (gpt-4o-mini)<br/>re-verify stock, record the order with fulfill_order<br/>estimate the delivery date"]
 
-        ORCH <-- "<b>1</b> items, qty, dates<br/>/ availability report" --> INV
-        ORCH <-- "<b>2</b> fulfillable items, context<br/>/ quote + discount" --> QUO
-        ORCH <-- "<b>3</b> accepted quote<br/>/ order confirmation" --> SAL
+        ORCH <-- "<b>1</b> items as written, qty, dates<br/>/ status per item" --> INV
+        ORCH <-- "<b>2</b> available items, context<br/>/ quote + discount" --> QUO
+        ORCH <-- "<b>3</b> accepted quote<br/>/ sale confirmation" --> SAL
     end
 
     CUST <-- "request + date<br/>/ quote, delivery date,<br/>items not fulfilled + why" --> ORCH
 
-    INVT["<b>Inventory tools</b><br/>find_catalog_items &rarr; paper_supplies<br/>check_inventory &rarr; get_all_inventory()<br/>check_stock_level &rarr; get_stock_level()<br/>check_supplier_delivery &rarr; get_supplier_delivery_date()<br/>check_cash_balance &rarr; get_cash_balance()<br/>restock_item &rarr; create_transaction('stock_orders')"]
-    QUOT["<b>Quoting tools</b><br/>search_past_quotes &rarr; search_quote_history()<br/>get_unit_price &rarr; paper_supplies<br/>calculate_quote &rarr; bulk discount tiers"]
-    SALT["<b>Sales tools</b><br/>check_stock_level &rarr; get_stock_level()<br/>check_delivery_date &rarr; get_supplier_delivery_date()<br/>fulfill_order &rarr; create_transaction('sales')<br/>get_financial_report &rarr; generate_financial_report()"]
+    INVT["<b>Inventory tools</b><br/>check_inventory, per item:<br/>find_catalog_items &rarr; paper_supplies (size + finish must match)<br/>stock &rarr; get_stock_level()<br/>restock_item &rarr; get_supplier_delivery_date(),<br/>get_cash_balance(), create_transaction('stock_orders')<br/>get_all_inventory()"]
+    QUOT["<b>Quoting tools</b><br/>calculate_quote &rarr; paper_supplies prices + bulk discount tiers<br/>search_quote_history()"]
+    SALT["<b>Sales tools</b><br/>check_stock_level &rarr; get_stock_level()<br/>fulfill_order &rarr; same pricing as calculate_quote,<br/>create_transaction('sales')<br/>get_supplier_delivery_date()<br/>generate_financial_report()"]
 
     INV --- INVT
     QUO --- QUOT
     SAL --- SALT
+
+    CTX[("<b>REQUEST_CONTEXT</b><br/>set by handle_request for one request<br/>request date, inventory rows, recorded sale")]
+
+    INVT -. "inventory rows" .-> CTX
+    CTX -. "available items + qty" .-> QUOT
+    CTX -. "request date, items, qty" .-> SALT
 
     subgraph DATA["Data sources"]
         direction LR
@@ -36,7 +43,7 @@ flowchart TB
     end
 
     INVT -- "names" --> CAT
-    INVT -- "read stock, cash" --> DB
+    INVT -- "read stock, cash, min level" --> DB
     INVT == "write stock_orders" ==> DB
     INVT -- "restock ETA" --> SUP
     QUOT -- "unit prices" --> CAT
@@ -50,12 +57,15 @@ flowchart TB
     classDef worker fill:#EAF7EE,stroke:#22874A,stroke-width:2px,color:#0B3319
     classDef tool fill:#FFFFFF,stroke:#8A8F98,stroke-width:1px,color:#1F2328
     classDef data fill:#F3EEFF,stroke:#6B46C1,stroke-width:2px,color:#24124F
+    classDef context fill:#FFF8DB,stroke:#B08800,stroke-width:2px,color:#3D2E00
 
     class CUST customer
     class ORCH orchestrator
     class INV,QUO,SAL worker
     class INVT,QUOT,SALT tool
     class CAT,DB,SUP data
+    class CTX context
 
     linkStyle 4,5,6 stroke:#8A8F98,stroke-dasharray:4 3
-    linkStyle 9,13 stroke:#C23B3B,stroke-width:3px
+    linkStyle 7,8,9 stroke:#B08800,stroke-width:2px,stroke-dasharray:6 4
+    linkStyle 12,16 stroke:#C23B3B,stroke-width:3px
