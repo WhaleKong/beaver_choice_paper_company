@@ -21,7 +21,7 @@ The system uses smolagents and four agents (the limit is five):
   prices plus a bulk discount) and explains the price using similar past quotes
   (search_quote_history).
 - Sales Agent (gpt-4o-mini): re-checks stock, records the accepted order with fulfill_order,
-  and estimates the delivery date.
+  and reports the delivery date the inventory check confirmed.
 
 All seven starter helpers are used by at least one tool: get_all_inventory, get_stock_level,
 get_supplier_delivery_date, get_cash_balance, create_transaction, generate_financial_report,
@@ -36,36 +36,44 @@ sale; the workers' jobs are narrow enough for gpt-4o-mini.
 ---------------------------
 OrchestrationAgent.handle_request(request, request_date) runs one request:
 
-1. handle_request stores the request date in REQUEST_CONTEXT, a per-request store the tools
+1. handle_request stores the request date and text in REQUEST_CONTEXT, a per-request store the tools
    share. It is cleared when the request finishes.
-2. The Orchestrator sends the items, as the customer wrote them, with quantities and the
-   needed-by date to the Inventory Agent. The Inventory Agent calls check_inventory once.
+2. The Orchestrator sends the items, as the customer wrote them, with quantities, their units,
+   and the needed-by date to the Inventory Agent. The Inventory Agent calls check_inventory once.
    For each item the tool:
-     a. matches it to the catalog (find_catalog_items),
+     a. matches it to the catalog and converts the quantity to catalog units, e.g. 500 reams
+        -> 250,000 sheets (find_catalog_items),
      b. checks stock as of the request date (get_stock_level),
      c. restocks when stock is short of the request, or would fall below min_stock_level
         after the sale (restock_item). It orders the requested quantity plus the minimum
         level, but only if get_supplier_delivery_date is on or before the needed-by date and
         get_cash_balance covers the cost,
-     d. returns a status: available, not carried, or insufficient stock, with a note.
-   The rows are saved in REQUEST_CONTEXT.
+     d. returns a status: available, not carried, needs clarification (pack size unknown), or
+        insufficient stock, with a note. An available item also gets a ready date: the request
+        date when it is in stock, or the supplier delivery date when it had to be restocked.
+   The rows and the needed-by date are saved in REQUEST_CONTEXT.
 3. If no item is available, the Orchestrator declines politely and gives the reason for each
    item.
 4. Otherwise the Quoting Agent prices the available items. calculate_quote takes the items and
    quantities from REQUEST_CONTEXT, applies catalog prices and the discount tier, and the agent
    adds a short rationale.
 5. The Sales Agent records the order. fulfill_order prices it exactly like calculate_quote,
-   checks stock, and writes one 'sales' transaction per line item, dated the request date.
+   checks stock, and writes one 'sales' transaction per line item, dated the request date. Its
+   delivery date is the latest ready date from the inventory check; if that is after the
+   needed-by date, nothing is recorded. The Sales Agent has no date tool of its own.
 6. The Orchestrator replies with the quote, discount, delivery date, and the items that could
-   not be supplied and why. A final answer check (check_available_items_sold) refuses the reply
-   while available items are still unsold, so a partial order is never dropped.
+   not be supplied and why. Two final answer checks refuse the reply while available items are
+   still unsold (check_available_items_sold), or while it leaves out the sale's delivery date,
+   total, quantities, or unit prices, calls another date the customer's deadline, or contains a
+   placeholder such as [Your Name] (check_reply_matches_order).
 
 
 3. BUSINESS RULES
 -----------------
 - Catalog matching is strict on size and finish. An item matches only if the catalog item has
   the size the customer named (A4, A3, letter, 8.5"x11", 24"x36", ...) and its name covers every
-  finish or material asked for (glossy, matte, colored, recycled, ...). Examples:
+  finish or material asked for (glossy, matte, colored, recycled, ...). Sizes are read with any
+  inch mark (8.5"x11", 8.5'x11', 8.5 x 11), because agents rewrite the quotes. Examples:
     "heavy cardstock (white)"  -> Cardstock
     "A4 white printer paper"   -> A4 paper
     "printer paper"            -> Standard copy paper
@@ -75,7 +83,14 @@ OrchestrationAgent.handle_request(request, request_date) runs one request:
   5,000-9,999 -> 10%, 10,000 and above -> 15%.
 - The customer accepts the quote immediately (the test harness has no back-and-forth).
 - Partial fulfilment: unavailable items are left out with a reason; the rest is still sold.
-- Quantities are counted as stated ("500 reams" = 500 units), as in the historical quotes.
+- Packs are converted before stock, pricing, and the sale: paper is priced per sheet and a ream
+  holds 500 sheets, so "500 reams of printer paper" is 250,000 sheets of Standard copy paper.
+  The reply shows both ("500 reams (250,000 sheets) at $0.04 per sheet"). Packs with no standard
+  size (packets, boxes, cases, ...) are marked needs clarification and the customer is asked how
+  many sheets or items each holds.
+- Delivery dates: an item in stock is ready on the request date, a restocked item on the supplier
+  date. The order's delivery date is the latest of these and must be on or before the needed-by
+  date. A supplier date after the deadline is offered only as an alternative, never confirmed.
 - Replies must not reveal cash balance, inventory value, or margins.
 
 
@@ -92,31 +107,56 @@ So the deterministic parts are in code and the agents only choose the next step:
 - Every tool resolves item names with the same matching rule and rejects unknown items.
 - calculate_quote and fulfill_order share one pricing function, so the recorded price always
   equals the quote.
-- REQUEST_CONTEXT carries the request date, the available items and quantities, and the
-  recorded sale. Only the first inventory check counts and a request is sold only once.
+- REQUEST_CONTEXT carries the request and needed-by dates, the available items with quantities
+  in catalog units and their ready dates, and the recorded sale. Each item is checked once (asking
+  again returns its first row), each quantity in the customer's text can be checked only once (so
+  no substitutes), and a request is sold only once. Inventory checks and sales run under a lock,
+  because the models sometimes call these tools in parallel (one run recorded a sale twice).
+- Within a request, calculate_quote and fulfill_order always cover every available item, whatever
+  item names the agent passes (another run sent one fulfill_order call per item and only the first
+  item was sold, without its bulk discount).
+- Unit conversion happens once, in check_inventory, so stock, restock, quote, and sale all use
+  the same converted quantity. check_inventory also rejects quantities or pack units that are
+  not in the customer's text: in one run the inventory model turned "200 sheets" into "1 ream"
+  on its own, which sold 500 sheets. The delivery date also comes from check_inventory: an earlier
+  version let the Sales Agent re-estimate it from the sale quantity, which promised an in-stock
+  item three days after the customer's deadline.
 - Stock checks also count transactions dated after the check date, so stock never goes negative.
-- The Orchestrator's final answer check enforces partial fulfilment.
+- The Orchestrator's final answer checks enforce partial fulfilment and require the reply to
+  give the sale's delivery date, total, quantities, and unit prices as fulfill_order recorded
+  them, and the customer's real needed-by date (one reply called the day before it the deadline).
 
 
 5. EVALUATION OF test_results.csv
 ---------------------------------
 All 20 requests in quote_requests_sample.csv (2025-04-01 to 2025-04-17) were processed with no
-errors.
+errors by the final version of the code.
 
-- 15 requests were fulfilled, fully or partly; 5 were declined with a reason.
-- In all 20 requests the items sold were exactly the items the inventory check marked available.
-  All recorded sales use catalog item names and catalog prices with the correct discount, and no
-  item's stock went negative.
-- Cash went from $45,059.70 to $45,387.25; inventory value went from $4,940.30 to $4,398.40.
-  26 sale lines brought in $2,742.15 and 20 stock orders cost $2,414.60. The cash balance
-  changed after 10 of the 20 requests (the other fulfilled requests restocked for about what
-  they sold).
+- 15 requests were fulfilled, fully or partly; 5 were declined with a reason (#8, #9, #11, #13,
+  #15).
+- Every reply was checked against the database. The items sold are exactly the items the
+  inventory check marked available, recorded under catalog names and catalog prices with the
+  correct discount, and each reply gives the recorded total, delivery date, quantities, and unit
+  prices. No sale was recorded twice and no item's stock went negative.
+- Cash went from $45,059.70 to $43,890.25; inventory value went from $4,940.30 to $4,398.40.
+  26 sale lines brought in $11,225.15 and 20 stock orders cost $12,394.60. Most of the drop is
+  #3: restocking 250,000 sheets of Standard copy paper and 9,863 sheets of A4 paper cost
+  $10,493.15, and the order sold for $8,925.00 after its 15% discount (see improvement 1). The
+  cash balance changed after 10 of the 20 requests.
 
 Examples:
-- #1  Sold 100 Cardstock and 100 Colored paper ($25.00); "A4 glossy paper" is not carried.
-- #3  10,000 A4 paper + 500 Standard copy paper = 10,500 units, 15% discount ($442.00). A4 paper
-      was restocked first (supplier delivery 2025-04-11, before the needed-by date). "A3 paper"
-      is not carried.
+- #3  10,000 sheets of A4 paper + 500 reams of printer paper (500 x 500 = 250,000 sheets of
+      Standard copy paper) = 260,000 sheets, 15% discount ($8,925.00). The reply shows
+      "500 reams (250,000 sheets)" at $0.04 per sheet. Both items were restocked and are ready
+      2025-04-11, before the needed-by date of 2025-04-15. "A3 paper" is not carried.
+- #18 Colored paper (200 sheets) was in stock, so it is ready on the request date, 2025-04-14,
+      one day before the needed-by date, and the reply gives that date. White cardstock and
+      standard printing paper could only arrive on 2025-04-18; they were not sold, and the reply
+      offers that date as an alternative for the customer to accept.
+- #5  "8.5"x11" colored paper" is not carried (Letter-sized paper is not colored); Cardstock
+      and washi tape were sold ($85.00).
+- #6  Construction paper, Standard copy paper, and Cardstock = 1,000 sheets, 5% discount
+      ($73.15).
 - #20 5,000 Flyers + 2,000 Poster paper = 7,000 units, 10% discount ($1,125.00); "tickets" are
       not carried.
 - #14, #16, #17 Partial orders: the available item was sold (Cardstock, Poster paper, Paper
@@ -127,22 +167,29 @@ Examples:
       A4 matte, A5 colored, A3 glossy, ...).
 
 Strengths
-- Data integrity: names, prices, discounts, stock levels, and restock decisions follow the
-  rules in every run, whatever the models write.
+- Data integrity: names, quantities, units, prices, discounts, stock levels, restocks, and
+  delivery dates follow the rules in every run, whatever the models write.
+- Replies give the values that were recorded; the final answer checks make the Orchestrator
+  rewrite a reply that gives another delivery date, total, quantity, unit price, or deadline.
 - Partial orders are handled: customers get what is available and a reason for the rest.
 - The replies are customer-facing and do not reveal cash or inventory value.
 
 Limitations
 - The models are not deterministic, so the wording of replies changes between runs. Some
-  replies mention stock counts or a transaction ID, which the customer does not need.
+  replies mention stock counts, which the customer does not need.
 - The strict size rule turns away many requests for sizes the catalog lacks (A3, A5, A4 glossy).
+- Quantities and units are checked against the customer's text, but item descriptions are not,
+  so a model's paraphrase can change a match (one run sent "colored construction paper" for
+  "colorful construction paper", which is not carried).
+- The reply checks look for the recorded values in the text; they do not catch every extra
+  statement, e.g. #14 calls restocked Cardstock "in stock".
 
 
 6. SUGGESTED IMPROVEMENTS
 -------------------------
 1. Earn a margin on restocked items. Stock orders are paid at the catalog price, which is also
    the selling price, so a restocked item earns nothing and a discounted one loses money
-   (#2 sold $140.00 of goods and cash did not change; #3 lowered cash by $71.15). Add a supplier
+   (#2 sold $140.00 of goods and cash did not change; #3 lowered cash by $1,568.15). Add a supplier
    cost below the catalog price, or let the Quoting Agent limit the discount on restocked items.
 2. Offer alternatives instead of declining. For an item that is not carried, the Inventory
    Agent already knows the closest item (e.g. Glossy paper for "A4 glossy paper"). A
@@ -151,6 +198,6 @@ Limitations
 3. Offer partial quantities and backorders. When stock is short and the supplier is late, the
    customer could get what is in stock now and the rest on the supplier date (#16 had 135 of
    the 500 A4 sheets requested).
-4. Build the final reply from structured data. A reply template filled from REQUEST_CONTEXT
-   would keep the format consistent and leave out internal details such as stock counts and
-   transaction IDs.
+4. Build the final reply from structured data. The final answer checks already make the reply
+   give the recorded values; a reply template filled from REQUEST_CONTEXT would also keep the
+   format consistent and leave out internal details such as stock counts.

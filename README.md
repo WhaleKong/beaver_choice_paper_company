@@ -54,6 +54,9 @@ Add your OpenAI-compatible API key:
 `UDACITY_OPENAI_API_KEY=your_openai_key_here`
 
 This project uses a custom OpenAI-compatible proxy hosted at https://openai.vocareum.com/v1.
+To call OpenAI directly with your own key instead, also add:
+
+`OPENAI_API_BASE=https://api.openai.com/v1`
 
 ## How to Run the Project
 
