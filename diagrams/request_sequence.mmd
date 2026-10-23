@@ -1,0 +1,48 @@
+%%{init: {"sequence": {"messageFontSize": 15, "noteFontSize": 14, "actorFontSize": 15, "messageMargin": 38, "noteMargin": 12, "boxTextMargin": 8, "mirrorActors": false}, "themeVariables": {"fontSize": "15px"}}}%%
+%% Lifecycle of one customer request through the Munder Difflin multi-agent system.
+%% Arrows are tool calls or delegations; notes are reasoning steps or checks inside one agent or tool.
+sequenceDiagram
+    autonumber
+    actor C as Customer
+    participant O as Orchestrator Agent
+    participant I as Inventory Agent
+    participant Q as Quoting Agent
+    participant S as Sales Agent
+    participant DB as SQLite DB
+    participant SUP as Supplier (simulated)
+
+    C->>O: Quote request text + date of request
+    Note over O: handle_request stores the request date in REQUEST_CONTEXT
+    O->>I: Items as the customer wrote them, qty, request date, needed-by date
+    Note over I: check_inventory: one call, code decides each status
+    loop Each requested item
+        Note over I: find_catalog_items: size and finish must match,<br/>otherwise the item is not carried
+        I->>DB: get_stock_level(item, request date)
+        opt Stock short, or below min_stock_level after the sale
+            I->>SUP: get_supplier_delivery_date(request date, restock qty)
+            I->>DB: get_cash_balance(request date)
+            alt Supplier ETA <= needed-by date AND cash covers the cost
+                I->>DB: create_transaction('stock_orders')
+            else Too late or not enough cash
+                Note over I: insufficient stock (with reason) if stock is short
+            end
+        end
+    end
+    Note over I: Rows saved in REQUEST_CONTEXT (later calls return the same rows)
+    I-->>O: Status per item: available / not carried / insufficient stock + note
+
+    alt No item available
+        O-->>C: Polite decline with the reason for each item
+    else At least one item available
+        O->>Q: Available items (catalog names), qty, customer context
+        Q->>DB: search_quote_history(terms)
+        Note over Q: calculate_quote: available items and quantities from<br/>REQUEST_CONTEXT, catalog prices, bulk discount tier
+        Q-->>O: Quote (line items, discount, total, rationale)
+        O->>S: Record the accepted quote
+        S->>DB: check_stock_level -> get_stock_level (re-verify)
+        S->>DB: fulfill_order -> create_transaction('sales') per line item<br/>(same pricing as the quote, request date, once per request)
+        S->>SUP: get_supplier_delivery_date (delivery estimate)
+        S-->>O: Sale confirmation (transaction ids, delivery date)
+        Note over O: Final answer check passes once the sale is recorded
+        O-->>C: Quote + discount + delivery date (+ items not fulfilled and why)
+    end
