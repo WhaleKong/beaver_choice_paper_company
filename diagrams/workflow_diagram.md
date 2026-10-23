@@ -15,18 +15,19 @@ Sources: `agent_workflow.mmd`, `request_sequence.mmd` (Mermaid). Render with
 
 | Agent | Model | Responsibility | Tools → starter helpers |
 |---|---|---|---|
-| **Orchestrator** (`ToolCallingAgent`, `managed_agents=[inventory, quoting, sales]`) | gpt-4o, `parallel_tool_calls=False` | Delegate Inventory → Quoting → Sales, one agent per step; continue with the available items even when others are unavailable; write the customer reply without internal data (cash, inventory value, margins). A final answer check (`check_available_items_sold`) refuses the reply while available items are still unsold. | Calls the three worker agents only |
-| **Inventory Agent** | gpt-4o-mini | Send every requested item, as the customer wrote it, to `check_inventory` once and report each row unchanged | `check_inventory` → `find_catalog_items` (`paper_supplies`), `get_stock_level`, `restock_item` (`get_supplier_delivery_date`, `get_cash_balance`, `create_transaction('stock_orders')`)<br>`get_all_inventory` |
+| **Orchestrator** (`ToolCallingAgent`, `managed_agents=[inventory, quoting, sales]`) | gpt-4o, `parallel_tool_calls=False` | Delegate Inventory → Quoting → Sales, one agent per step; continue with the available items even when others are unavailable; write the customer reply without internal data (cash, inventory value, margins). Final answer checks refuse the reply while available items are still unsold (`check_available_items_sold`), or when it leaves out the sale's delivery date, total, quantities, or unit prices, misstates the needed-by date, or contains a placeholder (`check_reply_matches_order`). | Calls the three worker agents only |
+| **Inventory Agent** | gpt-4o-mini | Send every requested item, as the customer wrote it, with its quantity and unit to `check_inventory` once and report each row unchanged | `check_inventory` → `find_catalog_items` (`paper_supplies`, pack conversion), `get_stock_level`, `restock_item` (`get_supplier_delivery_date`, `get_cash_balance`, `create_transaction('stock_orders')`)<br>`get_all_inventory` |
 | **Quoting Agent** | gpt-4o-mini | Price the available items, explain the bulk discount tier using similar past quotes | `calculate_quote` → `paper_supplies` unit prices + discount tiers<br>`search_quote_history` |
-| **Sales Agent** | gpt-4o-mini | Re-verify stock, record the accepted order, estimate the delivery date | `check_stock_level` → `get_stock_level`<br>`fulfill_order` → same pricing as `calculate_quote`, `create_transaction('sales')`<br>`get_supplier_delivery_date`<br>`generate_financial_report` |
+| **Sales Agent** | gpt-4o-mini | Re-verify stock, record the accepted order, report the delivery date the inventory check confirmed | `check_stock_level` → `get_stock_level`<br>`fulfill_order` → same pricing as `calculate_quote`, ready dates from `REQUEST_CONTEXT`, `create_transaction('sales')`<br>`generate_financial_report` |
 
 All seven starter helpers are used by at least one tool. Data sources are the SQLite database
 `munder_difflin.db` (`transactions`, `inventory`, `quotes`, `quote_requests`), the `paper_supplies`
 catalog, and the supplier lead time simulated by `get_supplier_delivery_date`.
 
 **`REQUEST_CONTEXT`** is per-request state that `OrchestrationAgent.handle_request` fills in and
-clears. It holds the request date, the rows from the first `check_inventory` call, and the recorded
-sale, so dates, item names, and quantities do not have to be copied between agents as text.
+clears. It holds the request date and text, the needed-by date, the rows from the first `check_inventory` call
+(with quantities in catalog units and each item's ready date), and the recorded sale, so dates, item
+names, and quantities do not have to be copied between agents as text.
 
 ## 2. Request lifecycle
 
@@ -50,8 +51,15 @@ sale, so dates, item names, and quantities do not have to be copied between agen
   Orchestrator sends a polite decline.
 - **Bulk discount tiers** (by total units in the order):
   under 1,000 → 0%; 1,000–4,999 → 5%; 5,000–9,999 → 10%; 10,000 and above → 15%.
-- **Quantities are counted as stated.** "500 reams" is 500 units of the catalog item, as in the
-  historical quotes.
+- **Packs are converted to catalog units.** Paper is priced per sheet, so "500 reams" of printer
+  paper is 500 × 500 = 250,000 sheets of `Standard copy paper`. The conversion happens in
+  `check_inventory`, before the stock check, restock, quote, and sale, and the reply shows it. Packs
+  with no standard size (packets, boxes, cases, ...) are marked *needs clarification* and the
+  customer is asked how many sheets or items each pack holds.
+- **One delivery date per item, from the inventory check.** An item in stock is ready on the request
+  date; a restocked item is ready on the supplier ETA. `fulfill_order` reports the latest ready date
+  of the sold items as the delivery date and records nothing if that date is after the needed-by
+  date. Supplier dates after the deadline are offered only as alternatives.
 
 ## 4. Safeguards in the tools
 
@@ -63,5 +71,11 @@ sale, so dates, item names, and quantities do not have to be copied between agen
 | Wrong quantities or dates copied between agents | Tools take the request date and the available quantities from `REQUEST_CONTEXT` |
 | A sale recorded under a later date makes stock negative later | Stock checks also count transactions dated after the check date |
 | The same agent run concurrently, or Sales called before the quote | Orchestrator calls one agent per step |
-| Substitute items offered, or the inventory re-checked | Only the first `check_inventory` call per request counts |
+| Substitute items offered, or the inventory re-checked | Each item is checked once; each quantity in the customer's text can be checked only once |
+| Items split over parallel `check_inventory` calls | Calls run under a lock and their rows are merged in `REQUEST_CONTEXT` |
+| Parallel `fulfill_order` calls record the same order twice | `fulfill_order` runs under the same lock and records a request once |
+| One `fulfill_order` call per item records only part of the order | Within a request, `calculate_quote` and `fulfill_order` always cover every available item, so the discount tier is for the whole order |
 | Available items left unsold when other items fail | Final answer check on the Orchestrator |
+| "500 reams" priced as 500 sheets | `check_inventory` converts packs to catalog units; unknown pack sizes need clarification |
+| A model converts or rounds units itself ("200 sheets" sent as "1 ream") | `check_inventory` rejects quantities and pack units that are not in the customer's text |
+| Sales agent re-estimates a later delivery date for an item in stock | Ready dates come from `check_inventory`; the Sales agent has no date tool; a final answer check requires the sale's delivery date in the reply |

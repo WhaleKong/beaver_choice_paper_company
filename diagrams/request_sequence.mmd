@@ -13,10 +13,10 @@ sequenceDiagram
 
     C->>O: Quote request text + date of request
     Note over O: handle_request stores the request date in REQUEST_CONTEXT
-    O->>I: Items as the customer wrote them, qty, request date, needed-by date
+    O->>I: Items as the customer wrote them, qty + unit, request date, needed-by date
     Note over I: check_inventory: one call, code decides each status
     loop Each requested item
-        Note over I: find_catalog_items: size and finish must match,<br/>otherwise the item is not carried
+        Note over I: find_catalog_items: size and finish must match,<br/>otherwise the item is not carried.<br/>Packs converted to catalog units (1 ream = 500 sheets),<br/>other pack sizes need clarification
         I->>DB: get_stock_level(item, request date)
         opt Stock short, or below min_stock_level after the sale
             I->>SUP: get_supplier_delivery_date(request date, restock qty)
@@ -28,8 +28,8 @@ sequenceDiagram
             end
         end
     end
-    Note over I: Rows saved in REQUEST_CONTEXT (later calls return the same rows)
-    I-->>O: Status per item: available / not carried / insufficient stock + note
+    Note over I: Ready date: request date if in stock, supplier ETA if restocked.<br/>Rows + needed-by date saved in REQUEST_CONTEXT (an item asked again keeps its first row)
+    I-->>O: Status per item: available / not carried / needs clarification /<br/>insufficient stock + note + ready date
 
     alt No item available
         O-->>C: Polite decline with the reason for each item
@@ -41,8 +41,8 @@ sequenceDiagram
         O->>S: Record the accepted quote
         S->>DB: check_stock_level -> get_stock_level (re-verify)
         S->>DB: fulfill_order -> create_transaction('sales') per line item<br/>(same pricing as the quote, request date, once per request)
-        S->>SUP: get_supplier_delivery_date (delivery estimate)
+        Note over S: delivery date = latest ready date from the inventory check,<br/>nothing recorded if it is after the needed-by date
         S-->>O: Sale confirmation (transaction ids, delivery date)
-        Note over O: Final answer check passes once the sale is recorded
+        Note over O: Final answer checks: sale recorded, and the reply gives<br/>its delivery date and converted pack quantities
         O-->>C: Quote + discount + delivery date (+ items not fulfilled and why)
     end

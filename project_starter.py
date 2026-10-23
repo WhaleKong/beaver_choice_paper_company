@@ -5,6 +5,7 @@ import time
 import dotenv
 import ast
 import re
+import threading
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Union
@@ -605,9 +606,13 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 # Set up and load your env parameters and instantiate your model.
 load_dotenv()
 
+# The Vocareum proxy by default; set OPENAI_API_BASE (e.g. https://api.openai.com/v1)
+# in .env to call OpenAI directly with your own key.
+API_BASE = os.getenv("OPENAI_API_BASE", "https://openai.vocareum.com/v1")
+
 model = OpenAIServerModel(
     model_id="gpt-4o-mini",
-    api_base="https://openai.vocareum.com/v1",
+    api_base=API_BASE,
     api_key=os.getenv("UDACITY_OPENAI_API_KEY"),
 )
 
@@ -616,7 +621,7 @@ model = OpenAIServerModel(
 # work to sales before the quote is ready.
 orchestrator_model = OpenAIServerModel(
     model_id="gpt-4o",
-    api_base="https://openai.vocareum.com/v1",
+    api_base=API_BASE,
     api_key=os.getenv("UDACITY_OPENAI_API_KEY"),
     parallel_tool_calls=False,
 )
@@ -648,7 +653,13 @@ TYPE_WORDS = {
 # Dimensions that correspond to named paper sizes
 SIZE_ALIASES = {"8.5x11": "letter", "8.5x14": "legal"}
 
-DIMENSION_PATTERN = re.compile(r'(\d+(?:\.\d+)?)\s*(?:"|”|in\b|inch(?:es)?)?\s*[x×]\s*(\d+(?:\.\d+)?)')
+# Inch marks include quotes and primes, since agents rewrite 8.5"x11" as 8.5'x11'
+DIMENSION_PATTERN = re.compile(r'(\d+(?:\.\d+)?)\s*(?:"|”|″|\'|’|′|in\b|inch(?:es)?)?\s*[x×]\s*(\d+(?:\.\d+)?)')
+
+# Units that hold several sheets or items. Only the ream has an established size;
+# for the others the customer has to confirm how many the pack holds.
+PACKAGING_UNITS = {"ream", "pack", "package", "packet", "box", "case", "carton", "bundle"}
+PACK_SIZES = {"ream": 500}  # sheets per ream
 
 
 def _extract_sizes(text: str) -> set:
@@ -698,6 +709,47 @@ def _catalog_name(item_name: str) -> Optional[str]:
     return candidates[0]["item_name"] if candidates and candidates[0]["fits"] else None
 
 
+def _pricing_unit(item_name: str) -> str:
+    """Return 'sheet' for papers priced per sheet and 'unit' for products priced per item."""
+    return "sheet" if CATALOG[item_name]["category"] in {"paper", "specialty"} else "unit"
+
+
+def _packaging_unit(text: str) -> Optional[str]:
+    """Return the packaging unit named in text, e.g. 'reams' -> 'ream', or None."""
+    for word in re.findall(r"[a-z]+", str(text).lower()):
+        for singular in (word, word[:-1], word[:-2]):
+            if singular in PACKAGING_UNITS:
+                return singular
+    return None
+
+
+def _catalog_quantity(item_name: str, quantity: int, unit: str, description: str) -> Dict:
+    """
+    Convert a requested quantity into the unit the catalog prices item_name in.
+
+    Packaging units are converted with an established pack size: 500 reams of a paper
+    priced per sheet is 250,000 sheets. Other units (sheets, rolls, units, ...) count
+    one to one. Returns the catalog quantity and the conversion, or the reason the
+    customer has to confirm the pack size.
+    """
+    package = _packaging_unit(unit) or _packaging_unit(description)
+    if package is None:
+        return {"quantity": quantity}
+    pricing_unit = _pricing_unit(item_name)
+    if package not in PACK_SIZES or pricing_unit != "sheet":
+        return {
+            "reason": f"A {package} of {item_name} has no standard size. Please confirm how many "
+                      f"{pricing_unit}s each {package} should hold.",
+        }
+    pack_size = PACK_SIZES[package]
+    catalog_quantity = quantity * pack_size
+    return {
+        "quantity": catalog_quantity,
+        "conversion": f"{quantity:,} {package}{'s' if quantity != 1 else ''} = {catalog_quantity:,} sheets "
+                      f"({pack_size} sheets per {package})",
+    }
+
+
 def _unknown_item_error(item_name: str) -> Dict:
     """Error returned when a tool receives a name that no catalog item fits."""
     return {
@@ -723,14 +775,18 @@ def _current_stock(item_name: str, as_of_date: str) -> int:
 # Tools take the request date, the inventory check, and the recorded sale from here
 # instead of trusting dates and quantities that agents copy to each other in text.
 REQUEST_CONTEXT = {}
+# Agents can call tools in parallel; tools that change REQUEST_CONTEXT hold this lock
+REQUEST_LOCK = threading.Lock()
 
 
 def _request_order(item_names: List[str], quantities: List[int]):
     """
-    While a request is being handled, keep the order to items the inventory check marked
-    available, in the quantity the customer asked for.
+    While a request is being handled, the order is every item the inventory check marked
+    available, in the quantity the customer asked for (in catalog units). The customer
+    accepts the whole quote, so an agent naming only some of the items, e.g. one call per
+    item, still gets the whole order and its bulk discount.
 
-    Returns (item_names, quantities), or an error dict if an item is not available.
+    Returns (item_names, quantities), or an error dict if a named item is not available.
     """
     if "request_date" not in REQUEST_CONTEXT:
         return item_names, quantities
@@ -751,7 +807,60 @@ def _request_order(item_names: List[str], quantities: List[int]):
             "reason": f"Not available for this request: {', '.join(unavailable)}. "
                       f"Available items: {available_text or 'none'}.",
         }
-    return names, [available[name] for name in names]
+    return list(available), list(available.values())
+
+
+def _quantities_not_in_request(descriptions: List[str], quantities: List[int], units: List[str]) -> Optional[str]:
+    """
+    While a request is being handled, return why a quantity or its pack unit is not one the
+    customer wrote (e.g. 200 sheets passed as 1 ream), or is one already checked for another
+    item (a substitute), or None when they all match.
+    """
+    request = REQUEST_CONTEXT.get("request_text", "").lower()
+    if not request:
+        return None
+    # Each quantity the customer wrote can be checked once
+    used = [
+        (int(row["requested_quantity"]), _packaging_unit(row["requested_unit"]) or _packaging_unit(row["requested"]))
+        for row in REQUEST_CONTEXT.get("inventory", [])
+    ]
+    not_written, already_checked = [], []
+    for description, quantity, unit in zip(descriptions, quantities, units):
+        package = _packaging_unit(unit) or _packaging_unit(description)
+        number = rf"(?<![\d,.])(?:{int(quantity):,}|{int(quantity)})(?!,?\d)"
+        # The pack unit (or None) written after each occurrence of the number
+        written_units = [_packaging_unit(word) for word in re.findall(rf"{number}\s*([a-z]*)", request)]
+        item = f"{quantity} {unit} of '{description}'"
+        if package not in written_units:
+            not_written.append(item)
+        elif written_units.count(package) <= used.count((int(quantity), package)):
+            already_checked.append(item)
+        used.append((int(quantity), package))
+
+    reasons = []
+    if not_written:
+        reasons.append(f"The customer did not write {', '.join(not_written)}. Pass each quantity "
+                       "and unit exactly as written in the request, without converting them.")
+    if already_checked:
+        reasons.append(f"The quantity of {', '.join(already_checked)} was already checked for another "
+                       "item. Do not check substitutes; report the rows already checked.")
+    return " ".join(reasons) or None
+
+
+def _available_rows(item_name: str) -> List[Dict]:
+    """Rows of the current request's inventory check that made item_name available."""
+    return [
+        row for row in REQUEST_CONTEXT.get("inventory", [])
+        if row["status"] == "available" and row["item_name"] == item_name
+    ]
+
+
+def _ordered_as(item_name: str) -> str:
+    """How the customer ordered item_name, with any unit conversion, e.g. '200 sheets'."""
+    return " + ".join(
+        row.get("conversion") or f"{row['requested_quantity']:,} {row['requested_unit']}"
+        for row in _available_rows(item_name)
+    )
 
 
 # Tools for inventory agent
@@ -805,34 +914,49 @@ def _not_carried_reason(description: str, candidates: List[Dict]) -> str:
 
 
 @tool
-def find_catalog_items(descriptions: List[str], quantities: List[int]) -> List[Dict]:
+def find_catalog_items(descriptions: List[str], quantities: List[int], units: List[str]) -> List[Dict]:
     """
     Match each requested product, as the customer described it, to the catalog item that fits it.
 
     An item fits when it has the size the customer asked for (if any) and its name
     covers every finish or material the customer asked for (glossy, matte, recycled, ...).
     For example, "A4 glossy paper" does not fit "A4 paper", so it is not carried.
+    Quantities are converted to the unit the catalog prices the item in: reams of a paper
+    priced per sheet hold 500 sheets each. Other packs (packets, boxes, cases, ...) have no
+    standard size, so the customer must confirm how many sheets or items they hold.
 
     Args:
         descriptions (List[str]): Each product as the customer described it, e.g. "A4 glossy paper".
         quantities (List[int]): Requested quantity of each product, in the same order as descriptions.
+        units (List[str]): The unit the customer gave each quantity in, as written, e.g. "sheets",
+            "reams", "rolls", or "units" when no unit is given. Same order as descriptions.
 
     Returns:
-        List[Dict]: One row per requested product with the customer's description, the
-        quantity, the status ('matched' or 'not carried'), and either the exact catalog
-        item_name or the reason the catalog does not carry it.
+        List[Dict]: One row per requested product with the customer's description, quantity,
+        and unit, the status ('matched', 'needs clarification', or 'not carried'), the exact
+        catalog item_name when matched, the quantity in catalog units with the conversion
+        and pricing unit, or the reason the item cannot be matched or converted.
     """
-    if len(descriptions) != len(quantities):
-        return [{"status": "error", "reason": "descriptions and quantities must have the same length."}]
+    if not len(descriptions) == len(quantities) == len(units):
+        return [{"status": "error", "reason": "descriptions, quantities, and units must have the same length."}]
 
     rows = []
-    for description, quantity in zip(descriptions, quantities):
+    for description, quantity, unit in zip(descriptions, quantities, units):
         candidates = _match_candidates(description)
-        row = {"requested": description, "quantity": quantity}
-        if candidates and candidates[0]["fits"]:
-            row.update(status="matched", item_name=candidates[0]["item_name"])
+        row = {"requested": description, "requested_quantity": quantity, "requested_unit": unit}
+        if not (candidates and candidates[0]["fits"]):
+            row.update(status="not carried", quantity=quantity,
+                       reason=_not_carried_reason(description, candidates))
+            rows.append(row)
+            continue
+
+        item_name = candidates[0]["item_name"]
+        row.update(item_name=item_name, pricing_unit=_pricing_unit(item_name))
+        converted = _catalog_quantity(item_name, quantity, unit, description)
+        if "reason" in converted:
+            row.update(status="needs clarification", quantity=quantity, reason=converted["reason"])
         else:
-            row.update(status="not carried", reason=_not_carried_reason(description, candidates))
+            row.update(status="matched", **converted)
         rows.append(row)
     return rows
 
@@ -947,6 +1071,7 @@ def restock_item(
 def check_inventory(
     descriptions: List[str],
     quantities: List[int],
+    units: List[str],
     request_date: str,
     needed_by_date: Optional[str] = None,
 ) -> List[Dict]:
@@ -954,51 +1079,88 @@ def check_inventory(
     Check every requested product: match it to the catalog, check its stock as of the
     request date, and restock it from the supplier when needed.
 
-    Products are matched like find_catalog_items. Each matched item is restocked like
+    Products are matched and their quantities converted to catalog units like
+    find_catalog_items. Each matched item is restocked like
     restock_item: up to the requested quantity plus its minimum stock level, only if the
     supplier can deliver by the needed-by date and the cash balance covers the cost.
-    While a customer request is being handled, only the first check counts: later calls
-    return the same rows.
+    Each available item gets a ready date: the request date when it is in stock, or the
+    supplier delivery date when it has to be restocked.
+    While a customer request is being handled, quantities and units must be the ones the
+    customer wrote (never converted), each item is checked only once (asking again returns
+    its first result), and the rows of every item checked so far are returned.
 
     Args:
         descriptions (List[str]): Each product as the customer described it, e.g. "A4 glossy paper".
         quantities (List[int]): Requested quantity of each product, in the same order as descriptions.
+        units (List[str]): The unit the customer gave each quantity in, as written, e.g. "sheets",
+            "reams", "rolls", or "units" when no unit is given. Same order as descriptions.
         request_date (str): Date of the customer request in ISO format (YYYY-MM-DD).
         needed_by_date (str, optional): Date the customer needs the items by in ISO format (YYYY-MM-DD).
 
     Returns:
-        List[Dict]: One row per requested product with the customer's description, the
-        quantity, the status ('available', 'not carried', or 'insufficient stock'), the
-        exact catalog item_name when matched, and a note explaining the status.
+        List[Dict]: One row per requested product with the customer's description, quantity,
+        and unit, the status ('available', 'not carried', 'needs clarification', or
+        'insufficient stock'), the exact catalog item_name and the quantity in catalog units
+        when matched, the ready date when available, and a note explaining the status.
     """
-    if "inventory" in REQUEST_CONTEXT:
-        return REQUEST_CONTEXT["inventory"]
-    request_date = REQUEST_CONTEXT.get("request_date", request_date)
+    # Agents may call this several times in parallel, e.g. one call per item
+    with REQUEST_LOCK:
+        if not len(descriptions) == len(quantities) == len(units):
+            return [{"status": "error", "note": "descriptions, quantities, and units must have the same length."}]
+        checked = REQUEST_CONTEXT.get("inventory", [])
+        # An item asked about again keeps its first result, so it is never re-checked
+        checked_descriptions = {row["requested"] for row in checked}
+        new_items = [item for item in zip(descriptions, quantities, units) if item[0] not in checked_descriptions]
+        if not new_items:
+            return checked
+        if "sale" in REQUEST_CONTEXT:
+            return [{"status": "error", "note": "The order for this request is already recorded, "
+                                                "so no more items can be checked."}] + checked
+        new_descriptions, new_quantities, new_units = (list(values) for values in zip(*new_items))
+        mismatch = _quantities_not_in_request(new_descriptions, new_quantities, new_units)
+        if mismatch:
+            return [{"status": "error", "note": mismatch}] + checked
 
-    rows = find_catalog_items(descriptions, quantities)
+        rows = _check_items(new_descriptions, new_quantities, new_units,
+                            REQUEST_CONTEXT.get("request_date", request_date), needed_by_date)
+        if "request_date" in REQUEST_CONTEXT and all(row["status"] != "error" for row in rows):
+            REQUEST_CONTEXT["inventory"] = checked + rows
+            REQUEST_CONTEXT["needed_by_date"] = REQUEST_CONTEXT.get("needed_by_date") or needed_by_date
+            return REQUEST_CONTEXT["inventory"]
+        return rows
+
+
+def _check_items(
+    descriptions: List[str],
+    quantities: List[int],
+    units: List[str],
+    request_date: str,
+    needed_by_date: Optional[str],
+) -> List[Dict]:
+    """Match, stock-check, and restock each product for check_inventory, one row per product."""
+    rows = find_catalog_items(descriptions, quantities, units)
     for row in rows:
         if row["status"] != "matched":
             row["note"] = row.pop("reason")
             continue
 
         current_stock = _current_stock(row["item_name"], request_date)
+        stock_text = f"{current_stock} {row['pricing_unit']}s in stock"
         restock = restock_item(row["item_name"], row["quantity"], request_date, needed_by_date)
-        if restock["status"] == "ordered":
+        if current_stock >= row["quantity"]:
+            # A restock that only tops up the minimum stock level does not delay this order
+            row.update(status="available", ready_date=request_date, note=f"{stock_text}, ready {request_date}.")
+        elif restock["status"] == "ordered":
             # The note leaves out the restocked units so they are not mistaken for the order quantity
             row.update(
                 status="available",
-                note=f"Available after a supplier restock arriving {restock['supplier_eta']}.",
+                ready_date=restock["supplier_eta"],
+                note=f"Ready {restock['supplier_eta']}, after a supplier restock.",
             )
-        elif current_stock >= row["quantity"]:
-            row.update(status="available", note=f"{current_stock} units in stock.")
         else:
-            row.update(
-                status="insufficient stock",
-                note=f"Only {current_stock} units in stock. {restock['reason']}",
-            )
-
-    if "request_date" in REQUEST_CONTEXT and all(row["status"] != "error" for row in rows):
-        REQUEST_CONTEXT["inventory"] = rows
+            row.update(status="insufficient stock", note=f"Only {stock_text}. {restock['reason']}")
+        if row.get("conversion"):
+            row["note"] = f"{row['conversion']}. {row['note']}"
     return rows
 
 
@@ -1014,10 +1176,12 @@ class InventoryAgent(ToolCallingAgent):
             model=model,
             name="inventory_processor",
             description="""
-            Matches requested items to exact catalog names, checks stock
-            as of a given date, and restocks items when stock is short.
-            Send it each item as the customer wrote it, the quantities,
-            the request date, and the needed-by date.
+            Matches requested items to exact catalog names, converts
+            quantities to catalog units, checks stock as of a given date,
+            and restocks items when stock is short. Send it each item as
+            the customer wrote it, the quantities with the unit of each
+            (sheets, reams, rolls, packets, ...), the request date, and
+            the needed-by date.
             """,
             instructions="""
             You are an Inventory Management Agent responsible for
@@ -1028,27 +1192,40 @@ class InventoryAgent(ToolCallingAgent):
 
             1. Inventory Check:
                - Call check_inventory once with every requested item
-                 as the customer described it, its quantity, the
-                 request date, and the needed-by date.
+                 as the customer described it, its quantity, the unit
+                 of that quantity as the customer wrote it (use "units"
+                 if none is given), the request date, and the
+                 needed-by date. For "200 sheets of colored paper" pass
+                 200 and "sheets"; for "500 reams of printer paper" pass
+                 500 and "reams".
                - check_inventory matches each item to the catalog,
-                 checks its stock, and restocks it when the supplier
-                 can deliver in time and cash allows.
+                 converts the quantity to catalog units itself, checks
+                 its stock, and restocks it when the supplier can
+                 deliver in time and cash allows. It gives each
+                 available item its ready date.
+               - Put every item in that single call; never one call
+                 per item.
+               - If check_inventory returns an error, fix the call as
+                 the error says and call it again.
 
             Decision-Making Rules:
                - Never guess item names, stock levels, or cash balances.
+               - Never convert, round, or change quantities or units.
                - Never fabricate database records or tool results.
-               - Never change a status, item name, quantity, or note
-                 returned by check_inventory.
+               - Never change a status, item name, quantity, ready date,
+                 or note returned by check_inventory.
 
             Return one line per row from check_inventory, in this form:
-               "<status>: <item_name> x <quantity> (customer asked for
-               '<requested>') - <note>"
+               "<status>: <item_name> x <quantity> <pricing_unit>s
+               (customer asked for <requested_quantity> <requested_unit>
+               of '<requested>') - <note>"
             For a not carried row, use the customer's wording in place
             of item_name. Put these lines in the short version of your
             answer. Example:
-               "available: Cardstock x 1000 (customer asked for
-               'cardstock in assorted colors') - Available after a
-               supplier restock arriving 2025-04-19."
+               "available: Standard copy paper x 250000 sheets (customer
+               asked for 500 reams of 'printer paper') - 500 reams =
+               250,000 sheets (500 sheets per ream). Ready 2025-04-11,
+               after a supplier restock."
             """
         )
 
@@ -1085,6 +1262,7 @@ def _price_order(item_names: List[str], quantities: List[int]) -> Dict:
             "item_name": item_name,
             "quantity": quantity,
             "unit_price": unit_price,
+            "pricing_unit": _pricing_unit(item_name),
             "subtotal": subtotal,
             "line_total": round(subtotal * (1 - discount_rate), 2),
         })
@@ -1108,21 +1286,27 @@ def calculate_quote(item_names: List[str], quantities: List[int]) -> Dict:
 
     Discount tiers by total units in the order: under 1,000 units 0%,
     1,000-4,999 units 5%, 5,000-9,999 units 10%, 10,000 units or more 15%.
-    While a customer request is being handled, only items the inventory check marked
-    available can be quoted, in the quantity the customer asked for.
+    While a customer request is being handled, the quote always covers every item the
+    inventory check marked available, in the catalog quantity the inventory check converted
+    the customer's quantity to (e.g. 500 reams = 250,000 sheets).
 
     Args:
         item_names (List[str]): Exact catalog item names, one per line item.
         quantities (List[int]): Quantity of each line item, in the same order as item_names.
 
     Returns:
-        Dict: Line items with unit price, subtotal, and line total after discount, plus
-        the total units, discount rate, subtotal, discount amount, and total price.
+        Dict: Line items with quantity, unit price and the unit it is priced per (sheet
+        or unit), subtotal, line total after discount, and how the customer ordered the
+        item, plus the total units, discount rate, subtotal, discount amount, and total price.
     """
     order = _request_order(item_names, quantities)
     if isinstance(order, dict):
         return order
-    return _price_order(*order)
+    quote = _price_order(*order)
+    if "inventory" in REQUEST_CONTEXT:
+        for line in quote.get("line_items", []):
+            line["ordered_as"] = _ordered_as(line["item_name"])
+    return quote
 
 
 class QuotingAgent(ToolCallingAgent):
@@ -1174,8 +1358,11 @@ class QuotingAgent(ToolCallingAgent):
                - Do not create or modify transactions.
 
             Return the quotation with:
-               - Each line item: exact item name, quantity, unit price,
-                 and line total after discount
+               - Each line item: exact item name, how the customer
+                 ordered it (ordered_as), quantity in catalog units, unit
+                 price per pricing unit, and line total after discount,
+                 e.g. "Standard copy paper: 500 reams (250,000 sheets) at
+                 $0.04 per sheet"
                - Total units, discount rate, discount amount, and total
                - A short pricing rationale
             """
@@ -1191,8 +1378,10 @@ def fulfill_order(item_names: List[str], quantities: List[int], date: str) -> Di
     The order is priced exactly like calculate_quote (catalog unit prices and the
     bulk discount tier), so the recorded prices match the quote. Nothing is recorded
     unless every line item is in stock. While a customer request is being handled, the
-    sale uses the request date and the quantities from the inventory check, and is
-    recorded only once.
+    sale covers every item the inventory check marked available, uses the request date
+    and the quantities from the inventory check, and is recorded only once. Each line item is ready on the date the inventory check gave it,
+    and the order's delivery date is the latest of these. The order is not recorded if
+    that date is after the customer's needed-by date.
 
     Args:
         item_names (List[str]): Exact catalog item names, one per line item.
@@ -1201,11 +1390,19 @@ def fulfill_order(item_names: List[str], quantities: List[int], date: str) -> Di
 
     Returns:
         Dict: The status ('recorded' or 'rejected'), and for a sale each line item with
-        its line total, transaction ID, and remaining stock, plus the order total;
+        how the customer ordered it, its line total, ready date, transaction ID, and
+        remaining stock, plus the order total, delivery date, and needed-by date;
         otherwise the reason.
     """
-    if "sale" in REQUEST_CONTEXT:
-        return REQUEST_CONTEXT["sale"]
+    # Parallel calls must not record the same order twice
+    with REQUEST_LOCK:
+        if "sale" in REQUEST_CONTEXT:
+            return REQUEST_CONTEXT["sale"]
+        return _record_sale(item_names, quantities, date)
+
+
+def _record_sale(item_names: List[str], quantities: List[int], date: str) -> Dict:
+    """Price, stock-check, and record the order for fulfill_order."""
     request_order = _request_order(item_names, quantities)
     if isinstance(request_order, dict):
         return {"status": "rejected", "reason": request_order["reason"]}
@@ -1223,8 +1420,20 @@ def fulfill_order(item_names: List[str], quantities: List[int], date: str) -> Di
         f"only {stock[item_name]} units of {item_name} in stock"
         for item_name, quantity in needed.items() if stock[item_name] < quantity
     ]
+    # Ready dates come from the inventory check, so the sale never promises a different date
+    ready_dates = {
+        item_name: max((row["ready_date"] for row in _available_rows(item_name)), default=date)
+        for item_name in needed
+    }
+    delivery_date = max(ready_dates.values())
+    needed_by_date = REQUEST_CONTEXT.get("needed_by_date")
+    reason = None
     if short_items:
         reason = "Not enough stock: " + "; ".join(short_items) + "."
+    elif needed_by_date and pd.Timestamp(delivery_date) > pd.Timestamp(needed_by_date):
+        reason = (f"The order can be ready on {delivery_date}, after the needed-by date {needed_by_date}. "
+                  f"Offer {delivery_date} to the customer as an alternative date.")
+    if reason:
         if "request_date" in REQUEST_CONTEXT:
             REQUEST_CONTEXT["sale_rejected"] = reason
         return {"status": "rejected", "reason": reason}
@@ -1234,12 +1443,22 @@ def fulfill_order(item_names: List[str], quantities: List[int], date: str) -> Di
         transaction_id = create_transaction(line["item_name"], "sales", line["quantity"], line["line_total"], date)
         recorded.append({
             "item_name": line["item_name"],
+            "ordered_as": _ordered_as(line["item_name"]),
             "quantity": line["quantity"],
+            "unit_price": line["unit_price"],
+            "pricing_unit": line["pricing_unit"],
             "line_total": line["line_total"],
+            "ready_date": ready_dates[line["item_name"]],
             "transaction_id": transaction_id,
             "remaining_stock": stock[line["item_name"]] - needed[line["item_name"]],
         })
-    sale = {"status": "recorded", "line_items": recorded, "total": order["total"]}
+    sale = {
+        "status": "recorded",
+        "line_items": recorded,
+        "total": order["total"],
+        "delivery_date": delivery_date,
+        "needed_by_date": needed_by_date,
+    }
     if "request_date" in REQUEST_CONTEXT:
         REQUEST_CONTEXT["sale"] = sale
     return sale
@@ -1253,19 +1472,19 @@ class SalesOrderingAgent(ToolCallingAgent):
             tools=[
                 check_stock_level,
                 fulfill_order,
-                get_supplier_delivery_date,
                 generate_financial_report,
             ],
             model=model,
             name="sales_order_processor",
             description="""
-            Records accepted orders as sales, estimates delivery dates,
-            and reports financial results. Send it the quoted line items
-            with exact item names and quantities, and the request date.
+            Records accepted orders as sales, reports the delivery date
+            the inventory check confirmed, and reports financial results.
+            Send it the quoted line items with exact item names and
+            quantities, and the request date.
             """,
             instructions="""
             You are a Sales Order Processing Agent responsible for
-            recording accepted orders and estimating delivery dates.
+            recording accepted orders and reporting their delivery dates.
 
             Your responsibilities include:
 
@@ -1284,11 +1503,10 @@ class SalesOrderingAgent(ToolCallingAgent):
                - If fulfill_order rejects the order, report its reason.
 
             3. Order Fulfillment:
-               - Estimate the delivery date of each line item with
-                 get_supplier_delivery_date, using the request date
-                 and the line item quantity.
-               - Report the latest of these dates as the order
-                 delivery date.
+               - Report the delivery_date returned by fulfill_order as
+                 the order delivery date, and the ready_date of each
+                 line item. These come from the inventory check.
+               - Never estimate or change a delivery date yourself.
 
             4. Financial Reporting:
                - Generate financial reports when requested.
@@ -1306,11 +1524,12 @@ class SalesOrderingAgent(ToolCallingAgent):
                  line items that could not be recorded.
 
             Return a concise order processing summary including:
-               - Product name and quantity
+               - Product name, how the customer ordered it (ordered_as),
+                 and quantity
                - Inventory availability
                - Order processing status
                - Transaction result, if applicable
-               - Estimated supplier delivery date, if needed
+               - Delivery date from fulfill_order and the needed-by date
                - Any fulfillment issues or recommendations
             """
         )
@@ -1334,6 +1553,85 @@ def check_available_items_sold(final_answer, memory, agent=None) -> bool:
     return True
 
 
+MONTH_DATE = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|"
+              r"Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?")
+DATE_IN_TEXT = rf"(?:{MONTH_DATE}|\d{{4}}-\d{{2}}-\d{{2}})"
+# A date the reply calls the customer's deadline, e.g. "needed-by date of April 15", "needed by
+# April 15", or "the April 15 deadline" (not "after the needed date (April 16)", a supplier date)
+DEADLINE_DATE = re.compile(
+    rf"(?:(?:deadline|needed[- ]by date|needed date|required (?:delivery )?date)(?:\s+(?:of|is|was)|\s*:)"
+    rf"|needed[- ]by)[\s*_]*({DATE_IN_TEXT})|({DATE_IN_TEXT}),?\s+deadline",
+    re.IGNORECASE,
+)
+# Unfilled template text such as "[Your Name]"
+PLACEHOLDER = re.compile(r"\[[^\]\n]{0,40}\b(?:name|title|company|contact)\b[^\]\n]{0,40}\]", re.IGNORECASE)
+
+
+def _parse_reply_date(text: str, year: int) -> Optional[datetime]:
+    """Parse a date written in a reply, e.g. 'April 15th, 2025' or '2025-04-15', or return None."""
+    text = " ".join(re.sub(r"(?<=\d)(?:st|nd|rd|th)", "", text.replace(".", "").replace(",", " ")).split())
+    for date_format in ("%Y-%m-%d", "%B %d %Y", "%b %d %Y", "%B %d", "%b %d"):
+        try:
+            parsed = datetime.strptime(text, date_format)
+        except ValueError:
+            continue
+        return parsed if "%Y" in date_format else parsed.replace(year=year)
+    return None
+
+
+def check_reply_matches_order(final_answer, memory, agent=None) -> bool:
+    """
+    Final answer check for the orchestrator: the reply must not call another date the
+    customer's deadline or leave template placeholders, and a reply about a recorded sale
+    must give the delivery date, total, quantities (e.g. 250,000 sheets for 500 reams), and
+    unit prices fulfill_order recorded, so it cannot promise another date, price, or quantity.
+    """
+    reply = str(final_answer)
+    problems = []
+
+    needed_by_date = REQUEST_CONTEXT.get("needed_by_date")
+    if needed_by_date:
+        needed_by = datetime.fromisoformat(needed_by_date)
+        for match in DEADLINE_DATE.finditer(reply):
+            written = match.group(1) or match.group(2)
+            if _parse_reply_date(written, needed_by.year) not in (None, needed_by):
+                problems.append(f"The reply calls {written} the customer's deadline, but the needed-by "
+                                f"date is {needed_by:%B} {needed_by.day}, {needed_by.year}.")
+
+    placeholders = PLACEHOLDER.findall(reply)
+    if placeholders:
+        problems.append(f"The reply contains the placeholder {', '.join(placeholders)}; "
+                        "sign it as Munder Difflin Paper Company.")
+
+    sale = REQUEST_CONTEXT.get("sale")
+    if sale:
+        missing = []
+        delivery = datetime.fromisoformat(sale["delivery_date"])
+        month = rf"(?:{delivery:%B}|{delivery:%b})\.?"
+        day = rf"{delivery.day}(?:st|nd|rd|th)?"
+        if sale["delivery_date"] not in reply and not re.search(
+            rf"\b{month}\s+{day}\b|\b{day}\s+{month}", reply
+        ):
+            missing.append(f"the delivery date {delivery:%B} {delivery.day}, {delivery.year}")
+
+        if f"{sale['total']:,.2f}" not in reply and f"{sale['total']:.2f}" not in reply:
+            missing.append(f"the total ${sale['total']:,.2f}")
+
+        for line in sale["line_items"]:
+            if f"{line['quantity']:,}" not in reply and str(line["quantity"]) not in reply:
+                missing.append(f"the quantity of {line['item_name']} as \"{line['ordered_as']}\"")
+            if f"{line['unit_price']:.2f}" not in reply:
+                missing.append(f"the unit price of {line['item_name']} "
+                               f"(${line['unit_price']:.2f} per {line['pricing_unit']})")
+        if missing:
+            problems.append(f"The reply must give {' and '.join(missing)}, as returned by fulfill_order. "
+                            "Do not give the sold items any other delivery date, price, or quantity.")
+
+    if problems:
+        raise ValueError(" ".join(problems))
+    return True
+
+
 class OrchestrationAgent(ToolCallingAgent):
     """Agent that coordinates the Inventory, Quoting, and Sales agents to answer customer requests."""
 
@@ -1350,7 +1648,7 @@ class OrchestrationAgent(ToolCallingAgent):
                 self.quotation_manager,
                 self.order_manager,
             ],
-            final_answer_checks=[check_available_items_sold],
+            final_answer_checks=[check_available_items_sold, check_reply_matches_order],
             name="orchestrator",
             description="""
             Coordinates the Munder Difflin agents to turn a customer
@@ -1369,16 +1667,20 @@ class OrchestrationAgent(ToolCallingAgent):
             Workflow:
 
             1. Parse the request:
-               - List each requested item and its quantity.
+               - List each requested item, its quantity, and the unit
+                 of that quantity as the customer wrote it (sheets,
+                 reams, rolls, packets, ...).
                - Note the request date and the date the customer
                  needs the items by, if given.
 
             2. Inventory check (inventory_processor):
                - Send each item exactly as the customer wrote it,
-                 with quantities, the request date, and the
-                 needed-by date.
+                 with quantities and their units, the request date,
+                 and the needed-by date. Never convert units yourself.
                - It returns each item as available, not carried,
-                 or insufficient stock.
+                 needs clarification (pack size unknown), or
+                 insufficient stock, with the quantity in catalog
+                 units and each available item's ready date.
 
             3. Quotation (quote_generator):
                - Skip this step and step 4 only if no item is available.
@@ -1396,14 +1698,32 @@ class OrchestrationAgent(ToolCallingAgent):
                - Send the quoted line items with exact catalog names
                  and quantities, and the request date.
                - Ask it to record one sale per line item and return
-                 the transaction results and estimated delivery date.
+                 the transaction results and the delivery date from
+                 fulfill_order.
 
             5. Reply to the customer:
                - Include the quote, discount, total price, and
                  delivery date, using the catalog name of each item.
+               - For each sold item give its quantity, unit price per
+                 sheet or unit, and line total.
+               - Give the needed-by date exactly as the customer did.
+               - Sign as Munder Difflin Paper Company. Never leave
+                 placeholders such as [Your Name].
+               - For an item ordered in packs, show the customer's
+                 quantity, the converted quantity, and the pricing
+                 unit, e.g. "500 reams (250,000 sheets) of Standard
+                 copy paper at $0.04 per sheet".
+               - The delivery date of the sold items is the
+                 delivery_date from fulfill_order. Never give them
+                 another date, and compare it with the needed-by date.
                - List items that are not carried (we do not sell that
                  product or size) separately from items that are out
-                 of stock and cannot be restocked in time.
+                 of stock and cannot be restocked in time. A supplier
+                 date after the needed-by date is only an alternative:
+                 say it misses the deadline and ask whether the
+                 customer wants the item on that date.
+               - For items that need clarification, ask the customer
+                 how many sheets or items each pack holds.
                - If no item is available, decline politely
                  with the reasons.
                - Only tell the customer an item is ordered if
@@ -1419,8 +1739,10 @@ class OrchestrationAgent(ToolCallingAgent):
                  name each item by the exact catalog name from
                  inventory_processor (e.g. "Cardstock"), never by the
                  customer's wording.
-               - Order each available item in the quantity the
-                 customer asked for, never in a restocked quantity.
+               - Order each available item in the catalog quantity
+                 inventory_processor returned (the customer's quantity
+                 converted to sheets or units), never in a restocked
+                 quantity.
                - Always pass the request date to every agent.
                - Only use exact item names returned by inventory_processor.
                - Never invent stock levels, prices, or transaction results.
@@ -1434,6 +1756,7 @@ class OrchestrationAgent(ToolCallingAgent):
         task = f"Customer request: {request}\nDate of request: {request_date}"
         REQUEST_CONTEXT.clear()
         REQUEST_CONTEXT["request_date"] = request_date
+        REQUEST_CONTEXT["request_text"] = request
         try:
             return str(self.run(task))
         finally:

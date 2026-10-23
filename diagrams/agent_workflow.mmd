@@ -8,10 +8,10 @@ flowchart TB
 
     subgraph MAS["Munder Difflin Multi-Agent System (smolagents, 4 agents)"]
         direction TB
-        ORCH["<b>Orchestrator Agent</b> (gpt-4o)<br/>ToolCallingAgent with managed_agents<br/>one agent per step (no parallel tool calls)<br/>delegate in order: Inventory, Quoting, Sales<br/>skip Quoting + Sales only if no item is available<br/>final answer check: available items must be sold first<br/>write the customer reply (no internal data)"]
-        INV["<b>Inventory Agent</b> (gpt-4o-mini)<br/>send every requested item to check_inventory once<br/>report each row as available, not carried,<br/>or insufficient stock, with its note"]
+        ORCH["<b>Orchestrator Agent</b> (gpt-4o)<br/>ToolCallingAgent with managed_agents<br/>one agent per step (no parallel tool calls)<br/>delegate in order: Inventory, Quoting, Sales<br/>skip Quoting + Sales only if no item is available<br/>final answer checks: available items must be sold first,<br/>reply gives the sale's delivery date + pack conversions<br/>write the customer reply (no internal data)"]
+        INV["<b>Inventory Agent</b> (gpt-4o-mini)<br/>send every requested item with qty + unit to check_inventory once<br/>report each row as available, not carried, needs clarification,<br/>or insufficient stock, with its note and ready date"]
         QUO["<b>Quoting Agent</b> (gpt-4o-mini)<br/>price the available items with calculate_quote<br/>explain the price using similar past quotes"]
-        SAL["<b>Sales Agent</b> (gpt-4o-mini)<br/>re-verify stock, record the order with fulfill_order<br/>estimate the delivery date"]
+        SAL["<b>Sales Agent</b> (gpt-4o-mini)<br/>re-verify stock, record the order with fulfill_order<br/>report its delivery date (from the inventory check)"]
 
         ORCH <-- "<b>1</b> items as written, qty, dates<br/>/ status per item" --> INV
         ORCH <-- "<b>2</b> available items, context<br/>/ quote + discount" --> QUO
@@ -20,19 +20,19 @@ flowchart TB
 
     CUST <-- "request + date<br/>/ quote, delivery date,<br/>items not fulfilled + why" --> ORCH
 
-    INVT["<b>Inventory tools</b><br/>check_inventory, per item:<br/>find_catalog_items &rarr; paper_supplies (size + finish must match)<br/>stock &rarr; get_stock_level()<br/>restock_item &rarr; get_supplier_delivery_date(),<br/>get_cash_balance(), create_transaction('stock_orders')<br/>get_all_inventory()"]
+    INVT["<b>Inventory tools</b><br/>check_inventory, per item:<br/>find_catalog_items &rarr; paper_supplies (size + finish must match),<br/>packs to catalog units (1 ream = 500 sheets)<br/>stock &rarr; get_stock_level()<br/>restock_item &rarr; get_supplier_delivery_date(),<br/>get_cash_balance(), create_transaction('stock_orders')<br/>get_all_inventory()"]
     QUOT["<b>Quoting tools</b><br/>calculate_quote &rarr; paper_supplies prices + bulk discount tiers<br/>search_quote_history()"]
-    SALT["<b>Sales tools</b><br/>check_stock_level &rarr; get_stock_level()<br/>fulfill_order &rarr; same pricing as calculate_quote,<br/>create_transaction('sales')<br/>get_supplier_delivery_date()<br/>generate_financial_report()"]
+    SALT["<b>Sales tools</b><br/>check_stock_level &rarr; get_stock_level()<br/>fulfill_order &rarr; same pricing as calculate_quote,<br/>create_transaction('sales'), ready dates as delivery date<br/>generate_financial_report()"]
 
     INV --- INVT
     QUO --- QUOT
     SAL --- SALT
 
-    CTX[("<b>REQUEST_CONTEXT</b><br/>set by handle_request for one request<br/>request date, inventory rows, recorded sale")]
+    CTX[("<b>REQUEST_CONTEXT</b><br/>set by handle_request for one request<br/>request + needed-by dates, inventory rows<br/>(catalog qty, ready dates), recorded sale")]
 
     INVT -. "inventory rows" .-> CTX
     CTX -. "available items + qty" .-> QUOT
-    CTX -. "request date, items, qty" .-> SALT
+    CTX -. "request date, items, qty, ready dates" .-> SALT
 
     subgraph DATA["Data sources"]
         direction LR
@@ -50,7 +50,6 @@ flowchart TB
     QUOT -- "read past quotes" --> DB
     SALT == "write sales" ==> DB
     SALT -- "read stock, report" --> DB
-    SALT -- "delivery ETA" --> SUP
 
     classDef customer fill:#FFF4E5,stroke:#C76B00,stroke-width:2px,color:#3D2200
     classDef orchestrator fill:#E8EEFF,stroke:#2F4FD0,stroke-width:2px,color:#0F1B4D
